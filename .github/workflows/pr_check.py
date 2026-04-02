@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-PR 自动审核脚本 v5
-严格对照《PR合并要求规范》：
-- 代码检查：PR标题格式、文件修改范围、截止时间
-- Kimi 检查：文件夹命名、文件数量/名称、内容质量、文件格式、AI Prompt、多余文件
+PR 自动审核脚本 - 融合版本
+结合 ChatGPT 版的健壮性和 Claude 版的完整性：
+- 分页获取 PR 文件（防止超 100 文件漏检）
+- 文件内容截断（防止 token 超限）
+- 禁止删除文件检查
+- 禁止修改以前作业检查
+- 完整规范嵌入 Kimi prompt
+- 详细的截止时间处理
 """
 
 import os
@@ -15,21 +19,24 @@ import datetime
 import requests
 
 # ── 环境变量 ──────────────────────────────────────────────
-PR_TITLE  = os.environ["PR_TITLE"]
+PR_TITLE = os.environ["PR_TITLE"]
 PR_NUMBER = os.environ["PR_NUMBER"]
-KIMI_KEY  = os.environ.get("KIMI_API_KEY", "")
-GH_TOKEN  = os.environ["GH_TOKEN"]
-REPO      = os.environ["REPO"]
-HEAD_SHA  = os.environ["HEAD_SHA"]
+KIMI_KEY = os.environ.get("KIMI_API_KEY", "")
+GH_TOKEN = os.environ["GH_TOKEN"]
+REPO = os.environ["REPO"]
+HEAD_SHA = os.environ["HEAD_SHA"]
 
 API = "https://api.github.com"
-GH  = {
+GH = {
     "Authorization": f"Bearer {GH_TOKEN}",
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-# 完整规范文档，塞进 Kimi prompt
+# 文件内容最大长度（防止 token 超限）
+MAX_CONTENT_LENGTH = 20000
+
+# 完整规范文档，嵌入 Kimi prompt
 SPEC = """# PR 合并要求规范
 
 ## 2. 学生文件夹规范
@@ -49,6 +56,10 @@ SPEC = """# PR 合并要求规范
 - 文件名必须与作业要求一致，大小写必须区分
 - 禁止多交文件：只能提交作业要求中明确列出的文件，多余文件（编译产物、临时文件、未要求的代码文件等）必须删除，发现多余文件禁止合并
 
+## 5. 修改范围限制（重要）
+- 只允许修改自己学号姓名文件夹内当前提交的 Lab 内容
+- 绝对禁止：修改其他任何地方、修改自己以前提交的作业、删除任何已存在的文件
+
 ## 6. 作业内容检查
 
 ### 禁止合并的问题
@@ -58,7 +69,7 @@ SPEC = """# PR 合并要求规范
 - 文件内容无效：作业文件为空、只有空格、或有效内容少于 10 行
 - 文件格式错误：不按照文件类型的标准格式书写
 - 文件类型与内容不匹配：
-  - .md 文件不使用 Markdown 语法（含 HTML 实体编码如 &#x20;、转义字符如 caesar\_decrypt、\[\] 等）
+  - .md 文件不使用 Markdown 语法（含 HTML 实体编码如 &#x20;、转义字符如 caesar\\_decrypt、\\[\\] 等）
   - .txt 文件不应使用 Markdown 格式或 HTML 标签
   - .py 文件写 Java/C/C++ 等其他语言代码，或有语法错误
   - 任何文件内容明显不符合其扩展名对应的标准格式
@@ -73,35 +84,65 @@ SPEC = """# PR 合并要求规范
 
 # ── GitHub API 工具 ───────────────────────────────────────
 
+
 def gh_get(path, params=None):
     r = requests.get(f"{API}{path}", headers=GH, params=params)
     r.raise_for_status()
     return r.json()
 
+
 def gh_post(path, body):
     requests.post(f"{API}{path}", headers=GH, json=body)
+
 
 def gh_put(path, body):
     r = requests.put(f"{API}{path}", headers=GH, json=body)
     return r.status_code == 200
 
+
 def gh_patch(path, body):
     requests.patch(f"{API}{path}", headers=GH, json=body)
 
+
+# ── 分页获取 PR 文件（防止超 100 文件漏检）─────────────────
+
+
+def get_changed_files_full():
+    """分页获取所有变更文件，返回完整文件对象列表"""
+    files = []
+    page = 1
+    while True:
+        batch = gh_get(
+            f"/repos/{REPO}/pulls/{PR_NUMBER}/files",
+            params={"page": page, "per_page": 100},
+        )
+        if not batch:
+            break
+        files.extend(batch)
+        page += 1
+    return files
+
+
+# ── 文件内容（带截断）────────────────────────────────────
+
+
 def get_file_content(file_path: str):
+    """获取文件内容，超长自动截断"""
     try:
         data = gh_get(
             f"/repos/{REPO}/contents/{requests.utils.quote(file_path, safe='/')}",
-            params={"ref": HEAD_SHA}
+            params={"ref": HEAD_SHA},
         )
         if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+            content = base64.b64decode(data["content"]).decode(
+                "utf-8", errors="replace"
+            )
+            if len(content) > MAX_CONTENT_LENGTH:
+                content = content[:MAX_CONTENT_LENGTH] + "\n...(truncated)"
+            return content
     except Exception:
         return None
 
-def get_changed_files():
-    files = gh_get(f"/repos/{REPO}/pulls/{PR_NUMBER}/files")
-    return [f["filename"] for f in files if f["status"] != "removed"]
 
 def get_homework_files(lab: str) -> dict:
     """读取 homework/LabX 下所有文件内容，返回 {path: content}"""
@@ -110,7 +151,8 @@ def get_homework_files(lab: str) -> dict:
         tree = gh_get(f"/repos/{REPO}/git/trees/HEAD", params={"recursive": "1"})
         prefix = f"homework/{lab}/"
         hw_paths = [
-            item["path"] for item in tree.get("tree", [])
+            item["path"]
+            for item in tree.get("tree", [])
             if item["type"] == "blob" and item["path"].startswith(prefix)
         ]
         for p in hw_paths:
@@ -129,10 +171,13 @@ def get_homework_files(lab: str) -> dict:
 
     return result
 
-# ── 评论 / 拒绝 / 合并 ────────────────────────────────────
+
+# ── 评论 / 拒绝 / 合并 / 关闭 ─────────────────────────────
+
 
 def comment(body: str):
     gh_post(f"/repos/{REPO}/issues/{PR_NUMBER}/comments", {"body": body})
+
 
 def reject(reason: str):
     comment(
@@ -142,19 +187,25 @@ def reject(reason: str):
     )
     sys.exit(0)
 
+
 def merge_pr():
-    return gh_put(f"/repos/{REPO}/pulls/{PR_NUMBER}/merge", {
-        "merge_method": "merge",
-        "commit_title": f"[自动合并] {PR_TITLE}",
-    })
+    return gh_put(
+        f"/repos/{REPO}/pulls/{PR_NUMBER}/merge",
+        {
+            "merge_method": "merge",
+            "commit_title": f"[自动合并] {PR_TITLE}",
+        },
+    )
+
 
 def close_pr():
     gh_patch(f"/repos/{REPO}/pulls/{PR_NUMBER}", {"state": "closed"})
 
-# ── 步骤 1：PR 标题格式（代码检查）──────────────────────
-# 规范第1条：[学号姓名]LabX作业提交，英文括号，10位学号，Lab大写
 
-TITLE_RE = re.compile(r'^\[(\d{10}[\u4e00-\u9fff]+)\]\s?(Lab\d+)作业提交$')
+# ── 步骤 1：PR 标题格式检查 ───────────────────────────────
+
+TITLE_RE = re.compile(r"^\[(\d{10}[\u4e00-\u9fff]+)\]\s?(Lab\d+)作业提交$")
+
 
 def check_title():
     m = TITLE_RE.match(PR_TITLE)
@@ -170,34 +221,77 @@ def check_title():
         )
     return m.group(1), m.group(2)
 
-# ── 步骤 2：修改范围检查（代码检查）─────────────────────
-# 规范第5条：只允许修改自己学号姓名文件夹内的内容
+
+# ── 步骤 2：禁止删除文件检查 ──────────────────────────────
+
+
+def check_no_delete(file_objs):
+    """检查是否有删除文件的操作"""
+    removed = [f["filename"] for f in file_objs if f["status"] == "removed"]
+    if removed:
+        reject(
+            f"**禁止删除文件**\n\n"
+            f"以下文件被删除，这是不允许的：\n\n"
+            + "\n".join(f"- `{f}`" for f in removed)
+            + "\n\n请撤销删除操作后重新提交。"
+        )
+
+
+# ── 步骤 3：修改范围检查（含禁止修改以前作业）─────────────
+
 
 def check_file_scope(student_id_name: str, lab: str, changed_files: list):
+    """
+    检查文件修改范围：
+    1. 只允许修改 学号姓名/当前Lab/ 下的内容
+    2. 禁止修改其他地方
+    3. 禁止修改以前的作业
+    """
     allowed_prefix = f"{student_id_name}/{lab}/"
-    violations = [f for f in changed_files if not f.startswith(allowed_prefix)]
+    violations = []
+    old_lab_violations = []
+
+    # 提取当前 Lab 编号
+    current_lab_num = int(re.search(r"\d+", lab).group())
+
+    for f in changed_files:
+        if not f.startswith(allowed_prefix):
+            # 检查是否是修改了自己的旧作业
+            old_lab_match = re.match(rf"^{re.escape(student_id_name)}/Lab(\d+)/", f)
+            if old_lab_match:
+                old_lab_num = int(old_lab_match.group(1))
+                if old_lab_num < current_lab_num:
+                    old_lab_violations.append(f)
+                    continue
+            violations.append(f)
+
+    if old_lab_violations:
+        reject(
+            f"**禁止修改以前的作业（规范第5条）**\n\n"
+            f"本次提交是 `{lab}`，但以下文件属于以前的作业：\n\n"
+            + "\n".join(f"- `{f}`" for f in old_lab_violations)
+            + "\n\n提交新作业时，不允许修改以前已提交的作业内容。"
+        )
+
     if violations:
         reject(
-            f"**修改范围超出自己的文件夹（规范第5条）**\n\n"
+            f"**修改范围超出允许范围（规范第5条）**\n\n"
             f"以下文件不在允许范围 `{allowed_prefix}` 内：\n\n"
             + "\n".join(f"- `{f}`" for f in violations)
             + "\n\n只允许修改自己 `学号姓名/LabX/` 文件夹内的内容，"
             f"禁止修改其他同学的文件夹、homework 文件夹或根目录文件。"
         )
 
-# ── 步骤 3：截止时间检查（代码检查）─────────────────────
-# 规范第7条：
-#   - 作业文件写明具体时间 → 按该时间
-#   - 只写日期 → 默认当天 18:00
-#   - 超时 0-7天 → 评论拒绝，不关闭
-#   - 超时 7天以上 → 关闭 PR
+
+# ── 步骤 4：截止时间检查 ──────────────────────────────────
 
 DEADLINE_DATETIME_RE = re.compile(
-    r'截止[时日][间期][：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2})'
+    r"截止[时日][间期][：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2})"
 )
 DEADLINE_DATE_RE = re.compile(
-    r'截止[时日][间期][：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?!\s*\d)'
+    r"截止[时日][间期][：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?!\s*\d)"
 )
+
 
 def get_deadline(lab: str):
     """返回 datetime 对象（北京时间），读不到返回 None"""
@@ -226,6 +320,7 @@ def get_deadline(lab: str):
             pass
 
     return None
+
 
 def check_deadline(lab: str):
     deadline = get_deadline(lab)
@@ -262,8 +357,10 @@ def check_deadline(lab: str):
     if delta_days > 7:
         # 超时 7 天以上，关闭 PR
         comment(
-            timeout_msg.replace("暂不予合并。如有特殊情况，请联系老师说明。",
-                                "超时 7 天以上，PR 已自动关闭。")
+            timeout_msg.replace(
+                "暂不予合并。如有特殊情况，请联系老师说明。",
+                "超时 7 天以上，PR 已自动关闭。",
+            )
         )
         close_pr()
         sys.exit(0)
@@ -272,8 +369,9 @@ def check_deadline(lab: str):
         comment(timeout_msg)
         sys.exit(0)
 
-# ── 步骤 4：Kimi 全面审核 ─────────────────────────────────
-# 覆盖规范第2、3、4、6条的所有细则
+
+# ── 步骤 5：Kimi 全面审核 ─────────────────────────────────
+
 
 def check_with_kimi(student_id_name: str, lab: str, changed_files: list):
     if not KIMI_KEY:
@@ -364,30 +462,40 @@ def check_with_kimi(student_id_name: str, lab: str, changed_files: list):
     except Exception as e:
         print(f"  [warn] Kimi 审核异常，跳过：{e}")
 
+
 # ── 主流程 ────────────────────────────────────────────────
+
 
 def main():
     print(f"[PR #{PR_NUMBER}] 开始审核：{PR_TITLE}")
 
-    # 1. 标题格式（规范第1条，代码检查）
+    # 1. 标题格式检查
     student_id_name, lab = check_title()
     print(f"  ✓ 标题格式正确：{student_id_name} / {lab}")
 
-    # 2. 获取变更文件
-    changed_files = get_changed_files()
-    if not changed_files:
+    # 2. 获取所有变更文件（分页）
+    file_objs = get_changed_files_full()
+    if not file_objs:
         reject("**PR 没有任何文件变更**，请确认是否提交了作业文件。")
-    print(f"  ✓ 获取到变更文件，共 {len(changed_files)} 个：{changed_files}")
+    print(f"  ✓ 获取到变更文件，共 {len(file_objs)} 个")
 
-    # 3. 修改范围（规范第5条，代码检查）
+    # 3. 禁止删除文件
+    check_no_delete(file_objs)
+    print(f"  ✓ 无删除文件操作")
+
+    # 4. 提取非删除文件路径
+    changed_files = [f["filename"] for f in file_objs if f["status"] != "removed"]
+    print(f"  ✓ 有效变更文件：{changed_files}")
+
+    # 5. 修改范围检查（含禁止修改以前作业）
     check_file_scope(student_id_name, lab, changed_files)
     print(f"  ✓ 文件修改范围正确")
 
-    # 4. 截止时间（规范第7条，代码检查）
+    # 6. 截止时间检查
     check_deadline(lab)
     print(f"  ✓ 截止时间检查通过")
 
-    # 5. Kimi 全面审核（规范第2、3、4、6条）
+    # 7. Kimi 全面审核
     check_with_kimi(student_id_name, lab, changed_files)
     print(f"  ✓ Kimi 审核通过")
 
@@ -398,7 +506,9 @@ def main():
         "| 检查项 | 结果 |\n"
         "|--------|------|\n"
         "| PR 标题格式 | ✅ |\n"
+        "| 禁止删除文件 | ✅ |\n"
         "| 文件修改范围 | ✅ |\n"
+        "| 禁止修改旧作业 | ✅ |\n"
         "| 截止时间 | ✅ |\n"
         "| 文件夹命名规范 | ✅ |\n"
         "| 作业文件完整性 | ✅ |\n"
@@ -411,6 +521,7 @@ def main():
     else:
         print(f"  ✗ 自动合并失败，请手动处理")
         comment("⚠️ 自动合并失败，可能存在合并冲突，请老师手动处理。")
+
 
 if __name__ == "__main__":
     main()
